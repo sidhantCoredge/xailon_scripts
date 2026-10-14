@@ -1,0 +1,68 @@
+# Argo CD Application — TokenFactory on xalion (Azure)
+#
+# This adopts the release that is currently installed via the helm CLI:
+#   release `tokenfactory`, namespace `xailon-tf-prod`
+# Change the release name and six subcharts start looking for `<release>-secrets`
+# and will not find `tokenfactory-secrets` — hence releaseName is pinned.
+#
+# SYNC: MANUAL only. `syncPolicy.automated` is deliberately absent — without it
+# Argo syncs nothing by itself and merely shows OutOfSync when the repo changes.
+# Prune is manual too: it only runs if "Prune" is ticked in the Sync dialog.
+#
+# So that deleting the Application does NOT delete the resources, the
+# `resources-finalizer.argocd.argoproj.io` finalizer was deliberately NOT added.
+# (The Argo UI adds it by default — it performs a cascading delete.)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: xailon-tokenfactory
+  namespace: argocd
+spec:
+  project: default
+
+  source:
+    repoURL: https://github.com/Infinia-Technology/ai-gateway-platform.git
+    targetRevision: main          # main only — not stage/develop
+    path: helm/tokenfactory
+    helm:
+      releaseName: tokenfactory   # DO NOT CHANGE
+      # the chart's own values.yaml is already applied by Helm as the base, so
+      # only the overlay is listed here. (Verified: the render of
+      # `-f values.yaml -f values-xailon-prod.yaml` and of `-f values-xailon-prod.yaml`
+      # alone are byte-for-byte identical.)
+      valueFiles:
+        - values-xailon-prod.yaml
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: xailon-tf-prod
+
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - RespectIgnoreDifferences=true
+      - PruneLast=true            # prune last, so the new resources come up first
+    retry:
+      limit: 2
+      backoff: { duration: 15s, factor: 2, maxDuration: 2m }
+
+  # The chart generates the `tf-auth-openmeter` Secret's token itself: it first
+  # tries `lookup` for the existing value, otherwise `randAlphaNum 48`. Argo's
+  # repo-server runs `helm template` without cluster access, so `lookup` is ALWAYS
+  # empty and a new token is generated on every refresh → the app is permanently
+  # OutOfSync and tf-auth restarts on every sync. The token is useless to us
+  # (tf-ledger talks to openmeter-api directly and its pod has no OPENMETER_TOKEN
+  # env var at all), so both the token and its checksum are ignored.
+  ignoreDifferences:
+    - group: ""
+      kind: Secret
+      name: tf-auth-openmeter
+      namespace: xailon-tf-prod
+      jsonPointers:
+        - /data/token
+    - group: apps
+      kind: Deployment
+      name: tf-auth
+      namespace: xailon-tf-prod
+      jsonPointers:
+        - /spec/template/metadata/annotations/checksum~1openmeter-secret

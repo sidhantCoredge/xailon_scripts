@@ -1,0 +1,109 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# cloudflared — Cloudflare Tunnel connector (xalion)
+#
+# Tunnel 7af01bd7-3244-4575-aca8-50dda73088bb, created from the UI. The
+# hostname-to-service routing is NOT IN THE CLUSTER — it lives in the Cloudflare
+# Zero Trust dashboard (Networks → Tunnels → Public Hostnames). Only the
+# connector runs here; it has no Service, opens no port, and makes only an
+# OUTBOUND connection.
+#
+#   Cloudflare edge → cloudflared → nginx-ingress (console/admin/auth)
+#                                 → envoy          (api)
+#
+# It was placed in this namespace so it could take the token from the existing
+# `tokenfactory-secrets` (created by the Key Vault CSI syncer), avoiding a
+# separate SPC and syncer. The token is `cloudflare-tunnel-token` in Key Vault.
+#
+# Firewall: `aks-cloudflare-tunnel` (network rule, 7844 TCP+UDP → 198.41.192.0/24
+# and 198.41.200.0/24) and `aks-cloudflare-api` are already in place. It goes out
+# on 7844, not 443 — which is why it is a network rule and not an application rule.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: cloudflare 
+  labels:
+    app.kubernetes.io/name: cloudflared
+spec:
+  # 2 connectors — multiple replicas on one tunnel is Cloudflare's supported
+  # pattern (the edge distributes the load itself). If one pod goes, the tunnel
+  # stays up.
+  replicas: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflared
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: cloudflared
+    spec:
+      # Both replicas on separate nodes — otherwise losing one node takes the whole tunnel.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: cloudflared
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: cloudflared
+          # 2026.9.3 — the image is distroless (entrypoint `cloudflared
+          # --no-autoupdate`, user 65532, no shell). That is why the token has to
+          # be passed by env var rather than by file.
+          image: cloudflare/cloudflared:2026.9.3
+          imagePullPolicy: IfNotPresent
+          args:
+            - tunnel
+            - --no-autoupdate
+            - --metrics
+            - 0.0.0.0:2000
+            - run
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: tokenfactory-secrets
+                  key: cloudflare-tunnel-token
+          ports:
+            - name: metrics
+              containerPort: 2000
+              protocol: TCP
+          # cloudflared's /ready returns 200 only once at least one connection to
+          # the edge is established — that is the real "tunnel up" signal.
+          livenessProbe:
+            httpGet: { path: /ready, port: metrics }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /ready, port: metrics }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+---
+# So that both connectors do not go away together during a node drain or an AKS upgrade.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cloudflared
+  namespace: cloudflare
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: cloudflared

@@ -1,0 +1,159 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# OpenMeter — Azure (xalion) overlay
+#
+# An Azure translation of production's live values. Only three things differ;
+# everything else is kept as production has it so that behaviour does not change.
+#
+#   1. Postgres  : pgdb.tokenfactory-prod (Zalando, in-cluster)
+#                  → psql-tokenfactory.postgres.database.azure.com (Flexible Server)
+#   2. appNamespace : tokenfactory-prod → xailon-tf-prod
+#   3. images    : from ACR (global.imageRegistry)
+#
+# INSTALL (a SEPARATE release in a SEPARATE namespace from the xalion umbrella):
+#   helm upgrade --install openmeter helm/infrastructure/openmeter \
+#     -n openmeter --create-namespace \
+#     -f openmeter-azure-values.yaml \
+#     --set openmeter.config.postgres.url="$OM_DSN" \
+#     --set openmeter.svix.database.dsn="$SVIX_DSN"
+#
+# The release MUST be named `openmeter`. Name it `openmeter-prod` and every
+# service becomes `openmeter-prod-*`, tf-ledger's OPENMETER_URL no longer matches,
+# and the provision-meters hook stalls silently (this has happened in production).
+# ─────────────────────────────────────────────────────────────────────────────
+
+global:
+  security:
+    # Bitnami's image-verification gate blocks non-bitnami repositories (the
+    # bundled redis comes from `bitnamilegacy/*`). Set in production too.
+    allowInsecureImages: true
+  # imageRegistry is DELIBERATELY not set.
+  #
+  # The upstream OpenMeter chart puts the FULL path in `image.repository`
+  # (`ghcr.io/openmeterio/openmeter`) — it has no separate `registry` field at
+  # all — so global.imageRegistry does not apply to it; it only affects the
+  # Bitnami sub-subcharts. Setting it merely redirected bitnamilegacy/* to ACR,
+  # WHERE THEY DO NOT EXIST → ImagePullBackOff. Now everything comes from its own
+  # real registry; ghcr.io and docker.io are both open in the firewall (rules 106
+  # and 110).
+  #
+  # To get everything into ACR you would have to write a SEPARATE override per
+  # image plus 8 `az acr import` calls — deliberately not done for now.
+
+openmeter:
+  # ── Postgres: Azure Flexible Server ────────────────────────────────────────
+  # The DSN is DELIBERATELY empty here. The upstream chart writes this value into
+  # a plain ConfigMap (`openmeter`) — not a Secret; in this version there is no
+  # existingSecret path for the DSN at all (verified in production). So the
+  # password must not go into git: pass it with --set at install time, reading the
+  # value from Key Vault. deploy-openmeter-azure.sh does exactly that.
+  config:
+    postgres:
+      autoMigrate: migration
+      url: ""   # --set openmeter.config.postgres.url=...
+    ingest:
+      kafka:
+        broker: "ehns-tokenfactory.servicebus.windows.net:9093"
+        securityProtocol: SASL_SSL
+        saslMechanisms: PLAIN
+        saslUsername: "$ConnectionString"
+        saslPassword: ""   # --set openmeter.config.ingest.kafka.saslPassword=...
+    sink:
+      kafka:
+        brokers: "ehns-tokenfactory.servicebus.windows.net:9093"
+        securityProtocol: SASL_SSL
+        saslMechanisms: PLAIN
+        saslUsername: "$ConnectionString"
+        saslPassword: ""   # --set openmeter.config.sink.kafka.saslPassword=...
+  # ── Replica counts ─────────────────────────────────────────────────────────
+  # Match the saif production openmeter release, where every one of these runs
+  # at 3. They were never set here, so the chart default of 1 applied and each
+  # component had a single pod — no redundancy at all.
+  #
+  # sinkWorker is the one that matters most: it is what writes usage events into
+  # ClickHouse, so losing its only pod stops the billing data path.
+  #
+  # kafka.controller and redis.replica are already 3 because the chart defaults
+  # them to 3; only the components below needed setting. (This deployment uses
+  # Azure Event Hubs rather than the bundled Kafka.)
+  api:
+    replicaCount: 3
+  balanceWorker:
+    replicaCount: 3
+  billingWorker:
+    replicaCount: 3
+  notificationService:
+    replicaCount: 3
+  sinkWorker:
+    replicaCount: 3
+
+  svix:
+    replicaCount: 3
+    database:
+      dsn: ""   # --set openmeter.svix.database.dsn=...
+
+  # ── Bundled Redis (Svix only) ──────────────────────────────────────────────
+  # Svix is the ONLY component that uses Redis: SVIX_REDIS_DSN points at
+  # openmeter-redis-master:6379, and it uses Redis for both its queue and its
+  # cache (SVIX_CACHE_TYPE=redis, SVIX_QUEUE_TYPE=redis). The OpenMeter config
+  # itself never mentions Redis — api and the workers use ClickHouse and
+  # Postgres.
+  #
+  # Read replicas cut from the chart default of 3 to 1. They were buying
+  # nothing:
+  #   - nobody reads from them. Svix connects to the master Service only.
+  #   - they give no failover. sentinel.enabled is false, so if the master dies
+  #     no replica promotes itself; Svix simply stops, because replicas reject
+  #     writes. Three replicas look like HA and are not.
+  #   - each one reserved 100m CPU and 128Mi on a node (limits 150m/192Mi)
+  #     while actually using ~22m and 4Mi, and held an 8Gi PVC for a dataset
+  #     that is 2.52 MB in production after 40 days.
+  #
+  # One replica is kept, not zero, so a warm copy still exists for a manual
+  # recovery if the master's volume is lost.
+  #
+  # Real HA here needs either sentinel.enabled: true, or moving Svix onto the
+  # Azure Managed Redis instance the application already uses.
+  redis:
+    replica:
+      replicaCount: 1
+
+  # ── NetworkPolicy ──────────────────────────────────────────────────────────
+  # An ingress-only NetworkPolicy on the OM API. appNamespace is tf-ledger's
+  # namespace — the policy's ONLY external-client source. Get it wrong and
+  # tf-ledger is blocked, which presents as "OpenMeter is not reachable".
+  networkPolicy:
+    enabled: true
+    appNamespace: xailon-tf-prod
+
+  # bundled PG off — we use the external Azure PG (as production does).
+  postgresql:
+    enabled: false
+
+  # ── Kafka: Azure Event Hubs (bundled Kafka OFF) ────────────────────────────
+  # `ehns-tokenfactory` is on the Standard SKU with kafkaEnabled=true, and the 7
+  # hubs it contains are exactly OpenMeter's topics (om_default_events,
+  # om_sys.ingest_events, om_sys.api_events, om_sys.balance_worker_events and the
+  # three DLQs). That namespace was created for this purpose.
+  #
+  # Chart behaviour: configmap.yaml overwrites `ingest.kafka.broker` and
+  # `sink.kafka.brokers` ONLY WHEN kafka.enabled is true. Set it to false and the
+  # config below survives.
+  #
+  # This removes all three: the Kafka StatefulSet (3 pods), its 8Gi PVC, and the
+  # bitnamilegacy/kafka image.
+  #
+  # saslPassword is EMPTY here: it is the full connection string (a secret) and
+  # the chart writes it into a plain ConfigMap. To keep it out of git it is passed
+  # with --set at install time from Key Vault (`eventhub-connection-string`).
+  # On Event Hubs the SASL username is always the literal `$ConnectionString`.
+  kafka:
+    enabled: false
+
+  # parity with production — the clickhouse operator keeps the same name.
+  altinity-clickhouse-operator:
+    fullnameOverride: openmeter-prod-clickhouse-operator
+
+  clickhouseGuardrails:
+    resources:
+      requests: { cpu: 250m, memory: 2Gi }
+      limits:   { memory: 8Gi }

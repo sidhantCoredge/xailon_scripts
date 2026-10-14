@@ -1,0 +1,155 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# cloudflared — in its own `cloudflare` namespace (xalion)
+#
+# WHY all of this: a k8s Secret is NAMESPACE-SCOPED. `tokenfactory-secrets` is
+# only created in `xailon-tf-prod`, so a pod in another namespace cannot read it
+# through secretKeyRef — that is where `CreateContainerConfigError` comes from.
+# This namespace needs its own SecretProviderClass and its own syncer.
+#
+# Why the syncer is a separate pod: `secretObjects` creates no k8s Secret until
+# some pod MOUNTS that CSI volume. Having cloudflared hold the mount is not a
+# good idea — the Secret's ownerReference would then point at cloudflared's
+# ReplicaSet, and once the old RS is garbage collected after a rollout the Secret
+# could disappear with it.
+#
+# Tunnel 7af01bd7-3244-4575-aca8-50dda73088bb. The hostname-to-service routing is
+# NOT IN THE CLUSTER — it lives in the Cloudflare Zero Trust dashboard. Only the
+# connector runs here: no Service, no open port, just outbound 7844.
+# ─────────────────────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cloudflare
+---
+apiVersion: secrets-store.csi.x-k8s.io/v1
+kind: SecretProviderClass
+metadata:
+  name: cloudflare-tunnel-kv
+  namespace: cloudflare
+spec:
+  provider: azure
+  parameters:
+    usePodIdentity: "false"
+    useVMManagedIdentity: "true"
+    # the CLIENT id of the AKS key_vault_secrets_provider addon's managed identity.
+    # (the objectId db66142c-… is a different value — that is for the role
+    # assignment on the vault.)
+    userAssignedIdentityID: "35f2629f-beb1-438e-8105-f3202518249d"
+    keyvaultName: "kv-tokenfactory"
+    tenantId: "6fc131bd-72da-4e55-bb85-5e873ab21dc6"
+    objects: |
+      array:
+        - |
+          objectName: cloudflare-tunnel-token
+          objectType: secret
+  secretObjects:
+    - secretName: cloudflare-tunnel
+      type: Opaque
+      data:
+        - { objectName: cloudflare-tunnel-token, key: token }
+---
+# Syncer — its only job is to keep the volume mounted so the Secret keeps existing.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: akv-secret-syncer
+  namespace: cloudflare
+  labels: { app.kubernetes.io/name: akv-secret-syncer }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: akv-secret-syncer }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: akv-secret-syncer }
+    spec:
+      containers:
+        - name: pause
+          image: acrtokenfactory.azurecr.io/busybox:1.36
+          command: ["sh", "-c", "trap : TERM INT; sleep infinity & wait"]
+          resources:
+            requests: { cpu: 10m, memory: 16Mi }
+            limits:   { memory: 64Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65534
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+          volumeMounts:
+            - { name: kv, mountPath: /mnt/kv, readOnly: true }
+      volumes:
+        - name: kv
+          csi:
+            driver: secrets-store.csi.k8s.io
+            readOnly: true
+            volumeAttributes: { secretProviderClass: cloudflare-tunnel-kv }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudflared
+  namespace: cloudflare
+  labels: { app.kubernetes.io/name: cloudflared }
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app.kubernetes.io/name: cloudflared }
+  strategy:
+    rollingUpdate: { maxUnavailable: 0, maxSurge: 1 }
+  template:
+    metadata:
+      labels: { app.kubernetes.io/name: cloudflared }
+    spec:
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: cloudflared }
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: cloudflared
+          # distroless: entrypoint `cloudflared --no-autoupdate`, user 65532, no
+          # shell — which is why the token is passed by env var, not by file.
+          image: cloudflare/cloudflared:2026.9.3
+          imagePullPolicy: IfNotPresent
+          args: [tunnel, --no-autoupdate, --metrics, "0.0.0.0:2000", run]
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef: { name: cloudflare-tunnel, key: token }
+          ports:
+            - { name: metrics, containerPort: 2000, protocol: TCP }
+          # /ready returns 200 only once at least one connection to the edge is up
+          livenessProbe:
+            httpGet: { path: /ready, port: metrics }
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /ready, port: metrics }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 65532
+            capabilities: { drop: ["ALL"] }
+            seccompProfile: { type: RuntimeDefault }
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: cloudflared
+  namespace: cloudflare
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels: { app.kubernetes.io/name: cloudflared }

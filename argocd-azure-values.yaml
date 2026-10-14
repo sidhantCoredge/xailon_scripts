@@ -1,0 +1,75 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Argo CD — INSIDE AKS (xalion)
+#
+# Why inside, rather than from the external argo-mgmt: the AKS cluster is private
+# (enablePrivateCluster=true, fqdn=null) — there is no route to its API from
+# outside at all. Running inside the cluster makes the destination
+# `https://kubernetes.default.svc`, so no inbound path has to be created.
+#
+# EVERY IMAGE FROM ACR — quay.io and ecr-public.aws.com are not open in the
+# firewall, and they do not need to be: `az acr import` is server-side.
+#   quay.io/argoproj/argocd:v3.5.4              -> acr/argoproj/argocd:v3.5.4
+#   ghcr.io/dexidp/dex:v2.45.1                  -> acr/dexidp/dex:v2.45.1
+#   ecr-public.aws.com/docker/library/redis:…   -> acr/library/redis:8.6.4-alpine
+#
+# INSTALL:
+#   helm upgrade --install argocd \
+#     oci://ghcr.io/argoproj/argo-helm/argo-cd --version 10.9.7 \
+#     -n argocd --create-namespace -f argocd-azure-values.yaml --wait
+# ─────────────────────────────────────────────────────────────────────────────
+
+global:
+  image:
+    repository: acrtokenfactory.azurecr.io/argoproj/argocd
+    tag: v3.5.4
+
+configs:
+  params:
+    # TLS terminates at the Cloudflare edge; cloudflared → argocd goes over
+    # plaintext HTTP. Leave this false and the server demands TLS itself, which
+    # returns 502 through the tunnel. Same pattern as the other hosts.
+    server.insecure: true
+  cm:
+    # its own hostname, for the UI and callbacks
+    url: https://argo.xailon.ai
+
+server:
+  replicas: 2
+  service:
+    # ClusterIP — NOT LoadBalancer. On AKS that immediately provisions a public
+    # IP (this has already happened with envoy), and cloudflared reaches it from
+    # inside the cluster anyway. Same decision as for nginx and envoy.
+    type: ClusterIP
+  # No Ingress — routing is done by the Cloudflare tunnel, not in the cluster.
+  ingress:
+    enabled: false
+
+repoServer:
+  replicas: 2
+
+applicationSet:
+  replicas: 1
+
+controller:
+  replicas: 1   # an HA controller above 1 needs a separate sharding config
+
+dex:
+  enabled: true
+  image:
+    repository: acrtokenfactory.azurecr.io/dexidp/dex
+    tag: v2.45.1
+
+redis:
+  enabled: true
+  image:
+    repository: acrtokenfactory.azurecr.io/library/redis
+    tag: 8.6.4-alpine
+
+# redis-ha and haproxy are deliberately OFF — they pull in further images
+# (haproxy from ecr-public), and a single redis is enough for Argo; its state is
+# only a cache, the source of truth being git and the cluster.
+redis-ha:
+  enabled: false
+
+notifications:
+  enabled: false

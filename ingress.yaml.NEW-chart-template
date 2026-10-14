@@ -1,0 +1,45 @@
+{{/*
+  Umbrella Ingress. DEFAULT OFF (ingress.enabled: false) — tokenfactory-prod's
+  live Ingress was created by hand and is not in git, so this template renders
+  nothing until an overlay explicitly enables it. That means existing
+  environments are completely unchanged.
+
+  Controller: F5's nginx.org/ingress-controller. The annotations come from values
+  DELIBERATELY (rather than being hardcoded) because the community
+  `ingress-nginx` uses a different annotation namespace
+  (nginx.ingress.kubernetes.io/*), and on the wrong controller `nginx.org/*` is
+  silently ignored.
+*/}}
+{{- if .Values.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.ingress.name | default (include "common.names.fullname" .) }}
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "common.labels.standard" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls: {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    {{- range .Values.ingress.hosts }}
+    {{- if not .host }}{{ fail "ingress.hosts[]: `host` is required" }}{{ end }}
+    {{- if not .service }}{{ fail (printf "ingress.hosts[%s]: `service` is required" .host) }}{{ end }}
+    - host: {{ .host | quote }}
+      http:
+        paths:
+          - path: {{ .path | default "/" }}
+            pathType: {{ .pathType | default "Prefix" }}
+            backend:
+              service:
+                name: {{ .service }}
+                port:
+                  number: {{ .port | default 80 }}
+    {{- end }}
+{{- end }}

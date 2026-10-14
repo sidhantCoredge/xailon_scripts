@@ -1,0 +1,63 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NGINX Ingress Controller — Azure (xalion)
+#
+# F5 NGINX Inc's controller (`nginx.org/ingress-controller`), NOT the community
+# `ingress-nginx`. The two use different annotation namespaces:
+#   F5        : nginx.org/*
+#   community : nginx.ingress.kubernetes.io/*
+# All the annotations on our Ingress are `nginx.org/*` — install the wrong
+# controller and they are silently IGNORED. Among them are `proxy-buffer-size:
+# 16k` and `proxy-buffers: 8 16k`, which are the "OIDC callback 502" fix from
+# chart changelog 0.14.1 — lose them and login can break.
+#
+# Chart 1.3.2 = appVersion 3.6.2, the same version running in tokenfactory-prod.
+#
+# INSTALL:
+#   helm upgrade --install nginx-ingress \
+#     oci://ghcr.io/nginxinc/charts/nginx-ingress --version 1.3.2 \
+#     -n nginx-ingress --create-namespace \
+#     -f nginx-ingress-azure-values.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+
+controller:
+  # ── Service: ClusterIP, NOT LoadBalancer ──────────────────────────────────
+  # Production uses a LoadBalancer, but there it is an INTERNAL IP (10.115.1.50).
+  # On AKS, `type: LoadBalancer` makes Azure provision a PUBLIC IP by itself, and
+  # `outbound_type = userDefinedRouting` does NOT prevent it. There are currently
+  # only 3 public IPs (Bastion/Firewall/VPN GW) and all three are authenticated —
+  # adding a fourth would go against the whole design.
+  # It is not needed either: cloudflared runs INSIDE the cluster and reaches nginx
+  # through service DNS. The traffic path stays:
+  #   Cloudflare edge → cloudflared pod → nginx-ingress (ClusterIP) → Ingress
+  service:
+    type: ClusterIP
+
+  # IngressClass `nginx` — our Ingress's `ingressClassName: nginx` matches this.
+  # setAsDefaultIngress false: so that other Ingresses in the cluster do not
+  # silently attach themselves to it.
+  ingressClass:
+    name: nginx
+    create: true
+    setAsDefaultIngress: false
+
+  # Only pick up Ingresses carrying this controller's IngressClass.
+  enableCustomResources: true
+  watchIngressWithoutClass: false
+
+  image:
+    repository: nginx/nginx-ingress
+    tag: "3.6.2"
+
+  replicaCount: 2
+
+  resources:
+    requests: { cpu: 100m, memory: 128Mi }
+    limits:   { memory: 512Mi }
+
+  # With readOnlyRootFilesystem, nginx needs its own temp/cache directories; the
+  # chart mounts an emptyDir itself. The rest of the hardening is the default.
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+
+  # For health/readiness the chart provides its own /nginx-health (port 8081).

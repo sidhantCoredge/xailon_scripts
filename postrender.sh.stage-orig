@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+#
+# postrender.sh — Helm `--post-renderer` for the OpenMeter release.
+#
+# Injects a startupProbe onto all 5 OpenMeter Deployments (api, balance-worker,
+# notification-service, sink-worker, billing-worker) via a kustomize strategic-
+# merge patch, WITHOUT forking or re-vendoring the pinned upstream chart
+# (helm/infrastructure/openmeter/charts/openmeter-1.0.0-beta.231.tgz — pin is
+# frozen by ADR-0001). See ../README or kustomization.yaml for the WHY.
+#
+# Helm calls post-renderers as: `<postrender> [args from --post-renderer-args]`
+# with the fully rendered manifest on stdin, and expects the (possibly
+# modified) manifest on stdout. Exit non-zero to fail the release.
+#
+# Uses `kubectl kustomize` (bundled with kubectl — no extra binary required)
+# rather than a standalone `kustomize` install.
+set -euo pipefail
+
+# Resolve our own directory regardless of CWD or how we were invoked (Helm
+# invokes post-renderers with the CWD of whatever process called `helm`, not
+# this script's own directory).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+command -v kubectl >/dev/null 2>&1 || {
+  echo "postrender.sh: kubectl not found on PATH (need 'kubectl kustomize')" >&2
+  exit 1
+}
+
+WORKDIR="$(mktemp -d)"
+cleanup() { rm -rf "$WORKDIR"; }
+trap cleanup EXIT
+
+# Helm's rendered manifest, read from stdin, becomes the sole kustomize resource.
+cat > "${WORKDIR}/all.yaml"
+
+cp "${SCRIPT_DIR}/kustomization.yaml"          "${WORKDIR}/kustomization.yaml"
+cp "${SCRIPT_DIR}/startup-probe-patch.yaml"    "${WORKDIR}/startup-probe-patch.yaml"
+
+kubectl kustomize "${WORKDIR}"
