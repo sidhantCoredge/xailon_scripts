@@ -1,0 +1,315 @@
+===============================================================================
+ XAILON TOKENFACTORY - JUMPHOST SCRIPT REFERENCE
+===============================================================================
+ Location on the jumphost : ~/xalion
+ Cluster / namespace      : aks-tokenfactory / xailon-tf-prod
+ Key Vault                : kv-tokenfactory
+ Postgres                 : psql-tokenfactory.postgres.database.azure.com
+ Container registry       : acrtokenfactory.azurecr.io
+
+ Run everything FROM THE JUMPHOST. Key Vault, Postgres, ACR and the AKS API
+ server are all private-endpoint only and are not reachable from anywhere else.
+
+ Most scripts accept --check, which reports the current state and changes
+ nothing. Use it first.
+===============================================================================
+
+
+-------------------------------------------------------------------------------
+ 1. SECRETS  (Key Vault -> Kubernetes Secret)
+-------------------------------------------------------------------------------
+
+kv-seed-secrets.sh
+  Does    : Generates the 14 self-generatable secrets in Key Vault and prompts
+            for the 5 that must come from outside (Google, Microsoft, Stripe,
+            SMTP).
+  Result  : Key Vault holds every secret the application needs. Existing
+            secrets are never overwritten, so re-running is safe.
+  Run     : ./kv-seed-secrets.sh
+            FORCE=1 ONLY=portal-jwt-secret ./kv-seed-secrets.sh   (rotate one)
+
+secretproviderclass-tokenfactory.yaml
+  Does    : Declares the namespace, the SecretProviderClass "tokenfactory-kv"
+            (which Key Vault secrets to fetch and which keys to write), and the
+            akv-secret-syncer Deployment that holds the CSI volume mounted.
+  Result  : The Secret "tokenfactory-secrets" exists in xailon-tf-prod and every
+            tf-* pod can read its credentials through secretKeyRef.
+  Run     : kubectl apply -f secretproviderclass-tokenfactory.yaml
+  Note    : The Secret is only created while a pod mounts the volume. That is
+            the syncer's entire purpose - do not delete that Deployment.
+
+deploy-secrets.sh
+  Does    : End-to-end driver for the above - checks Key Vault, fills in what is
+            missing, applies the manifest, forces a fresh mount, then polls until
+            the Secret has every key.
+  Result  : A verified "tokenfactory-secrets" with a printed key count.
+  Run     : ./deploy-secrets.sh --check      (report only)
+            ./deploy-secrets.sh              (prompt for missing, then apply)
+            ./deploy-secrets.sh --partial    (build the SPC from only the keys
+                                              that exist, for a half-seeded vault)
+            ./deploy-secrets.sh --dummy      (PLACEHOLDER values; bring-up test
+                                              only - SSO, Stripe and OTP break)
+
+.spc-partial.yaml
+  Does    : Output of "deploy-secrets.sh --partial". Machine-generated.
+  Result  : Not run directly.
+
+.spc-xailon-tf-prod.yaml
+  Does    : Byte-identical duplicate of secretproviderclass-tokenfactory.yaml,
+            left behind by "rename-ns.sh pre".
+  Result  : Nothing. Safe to delete.
+
+
+-------------------------------------------------------------------------------
+ 2. POSTGRES  (roles, databases, migrations)
+-------------------------------------------------------------------------------
+
+pg-create-roles.sh
+  Does    : Creates the tokenfactory / keycloak / openmeter / svix roles with
+            passwords read from Key Vault, then sets database and public-schema
+            ownership.
+  Result  : Each role can log in to its own database; the verification step at
+            the end prints OK or FAIL per role.
+  Run     : ./pg-create-roles.sh --check
+            ./pg-create-roles.sh
+  Note    : Also the correct way to re-sync a role password after rotating it in
+            Key Vault.
+
+fix-tf-migrations.sh
+  Does    : Unsticks a dirty golang-migrate flag on the tokenfactory database by
+            scaling the three migrator services to zero and bringing them back
+            one at a time at a single replica.
+  Result  : Both tracking tables reach their final version with dirty=false, and
+            the services return to 3 replicas.
+  Run     : ./fix-tf-migrations.sh --check
+            ./fix-tf-migrations.sh
+
+rebuild-tf-db.sh
+  Does    : DESTRUCTIVE. Drops and recreates the tokenfactory database, then runs
+            the migrations serialized, one service at a time.
+  Result  : A clean schema with every migration genuinely applied. Never clears
+            the dirty flag - it stops and shows the real error instead.
+  Run     : ./rebuild-tf-db.sh --check
+            ./rebuild-tf-db.sh
+  Note    : Refuses to run if the database holds more than 50 live rows, unless
+            FORCE_DROP=1 is set.
+
+pg-reset-openmeter-db.sh
+  Does    : DESTRUCTIVE. Drops and recreates the openmeter database and fixes
+            public-schema ownership.
+  Result  : An empty openmeter database, so the migration runs from scratch.
+  Run     : ./pg-reset-openmeter-db.sh --check
+            ./pg-reset-openmeter-db.sh
+  Note    : Refuses to run if it finds more than one live row, unless
+            FORCE_DROP=1 is set.
+
+fix-openmeter-migration.sh
+  Does    : Stops every OpenMeter workload that runs migrations, clears the dirty
+            flag, and lets openmeter-api complete the migration alone.
+  Result  : schema_om reaches its final version with dirty=false, and the other
+            workloads start cleanly.
+  Run     : ./fix-openmeter-migration.sh --check
+            ./fix-openmeter-migration.sh
+
+drive-migrations.sh
+  Does    : The thorough version - also suspends the CronJobs, then steps through
+            clear-dirty / one pod / check version until the version stops moving.
+  Result  : OpenMeter migrations confirmed complete, CronJobs resumed, workloads
+            back up.
+  Run     : ./drive-migrations.sh
+
+catch-migration-error.sh
+  Does    : Captures the REAL migration error, which is normally hidden because
+            every pod exits within a second logging only "Dirty database version".
+  Result  : A full single-run log in /tmp plus the extracted error message and any
+            permission or SQL hint.
+  Run     : ./catch-migration-error.sh
+
+reinstall-openmeter.sh
+  Does    : Full reset - helm uninstall, recreate the openmeter and svix
+            databases, reinstall, then auto-extract the first real error.
+  Result  : A clean OpenMeter install with the genuine failure cause printed if it
+            still fails.
+  Run     : ./reinstall-openmeter.sh
+
+
+-------------------------------------------------------------------------------
+ 3. OPENMETER  (metering, separate release and namespace)
+-------------------------------------------------------------------------------
+
+deploy-openmeter-azure.sh
+  Does    : Reads three secrets from Key Vault into a temporary mode-600 values
+            file, then calls the repository's own deploy-openmeter.sh, which
+            carries the post-renderer and the 20-minute timeout.
+  Result  : The "openmeter" release is installed in the openmeter namespace using
+            Azure Postgres and Event Hubs, with no bundled Kafka.
+  Run     : ./deploy-openmeter-azure.sh --check
+            ./deploy-openmeter-azure.sh
+            DRY_RUN=1 ./deploy-openmeter-azure.sh
+  Note    : The release must be named "openmeter" or tf-ledger's OPENMETER_URL
+            will not match.
+
+openmeter-azure-values.yaml
+  Does    : The Azure overlay - external Postgres, Event Hubs instead of Kafka,
+            replica counts at 3, Svix Redis read replicas reduced to 1,
+            NetworkPolicy pointing at xailon-tf-prod.
+  Result  : Not run directly; consumed by deploy-openmeter-azure.sh.
+
+postrender.sh.stage-orig
+  Does    : Reference copy of the repository post-renderer that injects startup
+            probes onto the five OpenMeter Deployments via kubectl kustomize.
+  Result  : Not run directly; invoked by Helm as --post-renderer.
+
+test-pr665.sh
+  Does    : Installs PR #665's OpenMeter chart for testing, with a revert path.
+  Result  : The openmeter release runs the PR's chart; --revert restores ours.
+  Run     : ./test-pr665.sh --dry
+            ./test-pr665.sh
+            ./test-pr665.sh --revert
+
+
+-------------------------------------------------------------------------------
+ 4. IMAGES  (ACR)
+-------------------------------------------------------------------------------
+
+acr-import-images.sh
+  Does    : CURRENT importer. Pulls the 13 tf-* images from GHCR and the 9 public
+            infra images into ACR, server-side, using credentials stored in Key
+            Vault. Skips anything already present.
+  Result  : Every required image is in ACR at the requested tag, verified by
+            digest.
+  Run     : TAG=0.16.2-0f05311 ./acr-import-images.sh --check
+            TAG=0.16.2-0f05311 ./acr-import-images.sh          (tf-* only)
+                               ./acr-import-images.sh --infra  (infra only)
+            TAG=0.16.2-0f05311 ./acr-import-images.sh --all
+  Note    : First run needs GHCR_USER and GHCR_PAT in the environment; after that
+            they come from Key Vault. "az acr import" is server-side, so it does
+            not use the jumphost disk and is not affected by the firewall.
+
+acr-import-tf-images.sh
+  Does    : SUPERSEDED by acr-import-images.sh. Handles only the 13 tf-* images.
+  Result  : Same as above for tf-* images.
+  Run     : TAG=<tag> ./acr-import-tf-images.sh [--check]
+
+
+-------------------------------------------------------------------------------
+ 5. NETWORKING  (Cloudflare tunnel, nginx ingress)
+-------------------------------------------------------------------------------
+
+cloudflared-ns.yaml
+  Does    : CURRENT version. Creates the "cloudflare" namespace with its own
+            SecretProviderClass, its own syncer, and cloudflared at 2 replicas
+            with a PodDisruptionBudget.
+  Result  : The Cloudflare tunnel connector runs with no Service and no open
+            port - outbound 7844 only. Hostname routing lives in the Cloudflare
+            Zero Trust dashboard, not in the cluster.
+  Run     : kubectl apply -f cloudflared-ns.yaml
+
+cloudflared.yaml
+  Does    : SUPERSEDED earlier version that reused tokenfactory-secrets.
+  Result  : Kept for reference.
+
+nginx-ingress-azure-values.yaml
+  Does    : Values for the F5 NGINX Ingress Controller, chart 1.3.2
+            (appVersion 3.6.2), Service as ClusterIP.
+  Result  : Not run directly. Install with:
+            helm upgrade --install nginx-ingress \
+              oci://ghcr.io/nginxinc/charts/nginx-ingress --version 1.3.2 \
+              -n nginx-ingress --create-namespace \
+              -f nginx-ingress-azure-values.yaml
+  Note    : Must be F5's controller, not the community ingress-nginx. Our
+            annotations are all nginx.org/* and the other controller ignores them
+            silently, including the proxy-buffer settings that fix the OIDC
+            callback 502.
+
+ingress.yaml.NEW-chart-template
+  Does    : Proposed chart template for the umbrella Ingress, default off.
+  Result  : Not run directly; a candidate chart change so the Ingress stops being
+            a hand-made object outside git.
+
+
+-------------------------------------------------------------------------------
+ 6. ARGO CD
+-------------------------------------------------------------------------------
+
+argocd-azure-values.yaml
+  Does    : Values for Argo CD running INSIDE the cluster, with every image from
+            ACR, server.insecure true, and ClusterIP Services.
+  Result  : Not run directly. Install with:
+            helm upgrade --install argocd \
+              oci://ghcr.io/argoproj/argo-helm/argo-cd --version 10.9.7 \
+              -n argocd --create-namespace -f argocd-azure-values.yaml --wait
+  Note    : It runs inside the cluster because the AKS API server is private and
+            has no route from outside.
+
+argocd-create-xailon-app.sh
+  Does    : Reads the GitHub PAT from Key Vault, proves it can reach the repo,
+            creates the repository Secret, and applies the Application.
+  Result  : The "xailon-tokenfactory" Application exists in Argo CD, unsynced.
+  Run     : ./argocd-create-xailon-app.sh
+  Note    : It never syncs - do that from the Argo UI. Press REFRESH and review
+            App Diff before the first Sync.
+
+argocd-app-xailon-tokenfactory.yaml
+  Does    : The Application definition - manual sync only, no cascading-delete
+            finalizer, releaseName pinned to "tokenfactory", and ignoreDifferences
+            for the tf-auth-openmeter token that would otherwise regenerate on
+            every refresh.
+  Result  : Applied by the script above.
+
+argocd-repo-secret.yaml
+  Does    : Template for the Argo CD repository credential. Contains placeholders,
+            not a real token.
+  Result  : Fill in the username and PAT, then kubectl apply -f it.
+
+
+-------------------------------------------------------------------------------
+ 7. LIFECYCLE  (rename, uninstall)
+-------------------------------------------------------------------------------
+
+rename-ns.sh
+  Does    : Moves the deployment from xalion-tf-prod to xailon-tf-prod, in
+            phases, because a namespace cannot be renamed.
+  Result  : The release runs in the new namespace. Only the "cut" phase causes
+            downtime.
+  Run     : ./rename-ns.sh plan        (read-only)
+            ./rename-ns.sh pre         (new ns, SPC, syncer, Secret, TLS - no downtime)
+            ./rename-ns.sh cut         (uninstall old, install new - DOWNTIME)
+            ./rename-ns.sh openmeter   (point OpenMeter's NetworkPolicy at the new ns)
+            ./rename-ns.sh verify      (checks, including external HTTP codes)
+            ./rename-ns.sh cleanup     (delete the old namespace, asks first)
+  Note    : One Cloudflare hostname must be changed by hand - api.xailon.ai from
+            envoy.<old-ns> to envoy.<new-ns>.
+
+uninstall-all.sh
+  Does    : Uninstalls the tokenfactory and openmeter releases in the correct
+            order - the ClickHouse CHI must go first, while its operator is still
+            running, or the finalizer hangs.
+  Result  : Both releases removed. Deliberately left behind: the syncer, the
+            SecretProviderClass, both Secrets, all Postgres data, Key Vault, and
+            ACR. The output lists what remains and how to reinstall.
+  Run     : ./uninstall-all.sh
+
+
+===============================================================================
+ KNOWN ISSUES IN THIS DIRECTORY
+===============================================================================
+
+ 1. secretproviderclass-tokenfactory.yaml does NOT match the live cluster and
+    would fail if applied as-is:
+      - it declares "stripe-secret-key", which does not exist in Key Vault, and
+        the CSI mount is all-or-nothing, so the syncer pod would fail to mount
+      - it omits "cloudflare-tunnel-token", which the live SecretProviderClass
+        carries
+    deploy-secrets.sh has the same problem in its REQUIRED array and will
+    refuse to apply until it is corrected.
+
+ 2. .spc-xailon-tf-prod.yaml is a byte-identical duplicate of
+    secretproviderclass-tokenfactory.yaml and can be deleted.
+
+ 3. acr-import-tf-images.sh and cloudflared.yaml are both superseded, by
+    acr-import-images.sh and cloudflared-ns.yaml respectively.
+
+ 4. Stripe is not configured on this environment. "stripe-secret-key" is absent
+    from Key Vault and "stripe-webhook-secret" holds the chart's inert
+    placeholder, so Checkout, top-up and webhooks are all inactive.
